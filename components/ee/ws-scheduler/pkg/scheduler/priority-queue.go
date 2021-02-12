@@ -1,9 +1,15 @@
+// Copyright (c) 2020 Gitpod GmbH. All rights reserved.
+// Licensed under the Gitpod Enterprise Source Code License,
+// See License.enterprise.txt in the project root folder.
+
 package scheduler
 
 import (
 	"sort"
 	"sync"
 	"time"
+
+	metrics "github.com/gitpod-io/gitpod/ws-scheduler/pkg/scheduler/metrics"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -43,8 +49,9 @@ type PriorityQueue struct {
 	lock sync.RWMutex
 	cond sync.Cond
 
-	activeQueue *podInfoQueue
-	backoffPool map[string]*QueuedPodInfo
+	activeQueue    *podInfoQueue
+	backoffPool    map[string]*QueuedPodInfo
+	backoffMetrics metrics.MetricRecorder
 }
 
 func NewPriorityQueue(lessFunc LessFunc, initialBackoff time.Duration, maximumBackoff time.Duration) *PriorityQueue {
@@ -55,8 +62,9 @@ func NewPriorityQueue(lessFunc LessFunc, initialBackoff time.Duration, maximumBa
 
 		stop: make(chan struct{}),
 
-		activeQueue: newPodInfoQueue(lessFunc),
-		backoffPool: make(map[string]*QueuedPodInfo),
+		activeQueue:    newPodInfoQueue(lessFunc, metrics.NewActivePodsRecorder()),
+		backoffPool:    make(map[string]*QueuedPodInfo),
+		backoffMetrics: metrics.NewBackoffPodsRecorder(),
 	}
 }
 
@@ -106,6 +114,7 @@ func (q *PriorityQueue) AddUnschedulable(pi *QueuedPodInfo) {
 	pi.Timestamp = time.Now()
 
 	q.backoffPool[key] = pi
+	q.backoffMetrics.Inc()
 }
 
 func (q *PriorityQueue) Delete(pod *corev1.Pod) bool {
@@ -140,6 +149,7 @@ func (q *PriorityQueue) MoveAllToActive(event string) {
 
 	for k, pi := range q.backoffPool {
 		delete(q.backoffPool, k)
+		q.backoffMetrics.Dec()
 		q.activeQueue.insert(pi)
 	}
 }
@@ -154,6 +164,7 @@ func (q *PriorityQueue) moveCompletedBackoffToActive() {
 			continue
 		}
 		delete(q.backoffPool, k)
+		q.backoffMetrics.Dec()
 		q.activeQueue.insert(pi)
 	}
 }
@@ -195,11 +206,17 @@ func (p *PriorityQueue) calculateBackoffDuration(podInfo *QueuedPodInfo) time.Du
 
 // podInfoQueue is a queue of QueuedPodInfo ordered by the given LessFunc.
 // It is _not_ synchronized and relies on users to do this.
+// This is _not_ optimized, and currently is:
+//  - insert: O(n*log(n))
+//  - delete: O(n*log(n))
+//  - pop: O(1)
 type podInfoQueue struct {
 	lessFunc LessFunc
 	// ordered list of keys
 	queue []*item
 	items map[string]*item
+
+	metrics metrics.MetricRecorder
 }
 
 type item struct {
@@ -209,11 +226,12 @@ type item struct {
 	index int
 }
 
-func newPodInfoQueue(lessFunc LessFunc) *podInfoQueue {
+func newPodInfoQueue(lessFunc LessFunc, metrics metrics.MetricRecorder) *podInfoQueue {
 	return &podInfoQueue{
 		lessFunc: lessFunc,
 		queue:    make([]*item, 0),
 		items:    make(map[string]*item, 0),
+		metrics:  metrics,
 	}
 }
 
@@ -229,10 +247,21 @@ func (q *podInfoQueue) insert(pi *QueuedPodInfo) {
 		lessFunc: q.lessFunc,
 		queue:    q.queue,
 	})
+
+	q.metrics.Inc()
 }
 
 func (q *podInfoQueue) pop() *QueuedPodInfo {
-	return nil
+	len := len(q.queue)
+	if len == 0 {
+		return nil
+	}
+	item := q.queue[len-1]
+	q.queue = q.queue[:len-1]
+	delete(q.items, item.key)
+
+	q.metrics.Dec()
+	return item.pi
 }
 
 func (q *podInfoQueue) contains(key string) bool {
@@ -253,6 +282,8 @@ func (q *podInfoQueue) delete(key string) bool {
 	for ; i < len(q.queue); i++ {
 		q.queue[i].index = i
 	}
+
+	q.metrics.Dec()
 	return true
 }
 

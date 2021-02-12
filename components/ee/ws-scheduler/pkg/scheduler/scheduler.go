@@ -19,6 +19,7 @@ import (
 	"time"
 
 	k8sinternal "github.com/gitpod-io/gitpod/ws-scheduler/pkg/scheduler/internal"
+	metrics "github.com/gitpod-io/gitpod/ws-scheduler/pkg/scheduler/metrics"
 
 	wsk8s "github.com/gitpod-io/gitpod/common-go/kubernetes"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -38,7 +39,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
-	"k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
 const (
@@ -47,9 +47,6 @@ const (
 
 	// the time a failed scheduling attempt has to wait before it is re-tried at most
 	queueMaximumBackoff = 4 * time.Second
-
-	// queueRescheduleInterval is the interval in which we revisit yet-unschedulable pods and try to schedule them again
-	queueRescheduleInterval = 2 * time.Second
 
 	// priorityOffsetRegularWorkspace ensures workspaces
 	priorityOffsetRegularWorkspace = 100000
@@ -398,8 +395,8 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 
 	// metrics
 	metrics.PodScheduled(workspaceType, metrics.SinceInSeconds(start))
-	metrics.PodSchedulingAttempts.Observe(float64(pi.Attempts))
-	metrics.PodSchedulingDuration.WithLabelValues(getAttemptsLabel(pi)).Observe(metrics.SinceInSeconds(pi.InitialAttemptTimestamp))
+	metrics.PodSchedulingAttempts.WithLabelValues(getAttemptsLabel(pi), workspaceType).Observe(float64(pi.Attempts))
+	metrics.PodSchedulingDuration.WithLabelValues(getAttemptsLabel(pi), workspaceType).Observe(metrics.SinceInSeconds(pi.InitialAttemptTimestamp))
 
 	return nil
 }
