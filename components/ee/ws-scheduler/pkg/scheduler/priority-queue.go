@@ -46,7 +46,7 @@ type PriorityQueue struct {
 	stop   chan struct{}
 	closed bool
 
-	lock sync.RWMutex
+	lock *sync.RWMutex
 	cond sync.Cond
 
 	activeQueue    *podInfoQueue
@@ -55,12 +55,16 @@ type PriorityQueue struct {
 }
 
 func NewPriorityQueue(lessFunc LessFunc, initialBackoff time.Duration, maximumBackoff time.Duration) *PriorityQueue {
+	lock := &sync.RWMutex{}
 	return &PriorityQueue{
 		lessFunc:       lessFunc,
 		initialBackoff: initialBackoff,
 		maximumBackoff: maximumBackoff,
 
 		stop: make(chan struct{}),
+
+		lock: lock,
+		cond: *sync.NewCond(lock),
 
 		activeQueue:    newPodInfoQueue(lessFunc, metrics.NewActivePodsRecorder()),
 		backoffPool:    make(map[string]*QueuedPodInfo),
@@ -152,6 +156,7 @@ func (q *PriorityQueue) MoveAllToActive(event string) {
 		q.backoffMetrics.Dec()
 		q.activeQueue.insert(pi)
 	}
+	q.cond.Broadcast()
 }
 
 func (q *PriorityQueue) moveCompletedBackoffToActive() {
@@ -167,6 +172,7 @@ func (q *PriorityQueue) moveCompletedBackoffToActive() {
 		q.backoffMetrics.Dec()
 		q.activeQueue.insert(pi)
 	}
+	q.cond.Broadcast()
 }
 
 func (q *PriorityQueue) Close() {
