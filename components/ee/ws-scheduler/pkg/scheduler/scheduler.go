@@ -541,6 +541,7 @@ func (s *Scheduler) bindPodToNode(ctx context.Context, pod *corev1.Pod, nodeName
 		},
 	}
 
+	start := time.Now()
 	err = s.Clientset.CoreV1().Pods(pod.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
 	if err != nil {
 		return xerrors.Errorf("cannot bind pod %s to %s: %w", pod.Name, nodeName, err)
@@ -576,6 +577,7 @@ func (s *Scheduler) bindPodToNode(ctx context.Context, pod *corev1.Pod, nodeName
 	}
 	span.LogKV("event", "event created")
 
+	metrics.BindingLatency.Observe(metrics.SinceInSeconds(start))
 	return nil
 }
 
