@@ -443,7 +443,7 @@ func (s *Scheduler) buildState(ctx context.Context, pod *corev1.Pod, ghostsVisib
 		return nil, xerrors.Errorf("cannot list all pods: %w", podsErr)
 	}
 
-	state = ComputeState(potentialNodes, allPods, s.localSlotCache.getListOfBindings(), &s.RAMSafetyBuffer, ghostsVisible, s.Config.Namespace)
+	state = ComputeState(potentialNodes, allPods, s.localSlotCache.getListOfBindings(pod.Name), &s.RAMSafetyBuffer, ghostsVisible, s.Config.Namespace)
 
 	// The required node services is basically PodAffinity light. They limit the nodes we can schedule
 	// workspace pods to based on other pods running on that node. We do this because we require that
@@ -836,12 +836,16 @@ func (c *localSlotCache) freeSlot(podName string) {
 	delete(c.slots, podName)
 }
 
-func (c *localSlotCache) getListOfBindings() []*Binding {
+func (c *localSlotCache) getListOfBindings(podName string) []*Binding {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	bs := make([]*Binding, 0, len(c.slots))
 	for _, s := range c.slots {
+		if !s.scheduled && s.binding.Pod.Name == podName {
+			// do _not_ include previously reserved slots for ourselves that we now want to update!
+			continue
+		}
 		bs = append(bs, s.binding)
 	}
 	return bs
