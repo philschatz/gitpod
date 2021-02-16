@@ -45,7 +45,9 @@ const (
 	// the time a failed scheduling attempt has to wait before it is re-tried initially
 	queueInitialBackoff = 1 * time.Second
 
-	// the time a failed scheduling attempt has to wait before it is re-tried at most
+	// the time a failed scheduling attempt has to wait before it is re-tried (at most).
+	// Note that external event thats "make space available" - like "pod got deleted", or "new node appeared" - will
+	// trigger re-evaluation no matter if the request is currently in backoff or not.
 	queueMaximumBackoff = 4 * time.Second
 
 	// priorityOffsetRegularWorkspace ensures workspaces
@@ -128,9 +130,6 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 			pod := pi.Pod
-
-			owi := wsk8s.GetOWIFromObject(&pod.ObjectMeta)
-			log.WithField("pod", pod.Name).WithFields(owi).Debug("scheduling pod")
 
 			err := s.schedulePod(ctx, pi)
 			if err != nil {
@@ -282,6 +281,8 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 	tracing.ApplyOWI(span, flds)
 	defer tracing.FinishSpan(span, &err)
 
+	log.WithFields(flds).Debug("scheduling pod")
+
 	// if the pod is known to have already been scheduled (locally): drop.
 	if s.localSlotCache.hasAlreadyBeenScheduled(pod.Name) {
 		span.LogFields(tracelog.String("schedulingResult", "alreadyScheduled"))
@@ -334,7 +335,26 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 		if unschedulable {
 			// this is more of a safety measure as it should never happen: If we do not fit on a node nor cannot find a
 			// spare ghost to delete on the node, we should have never been scheduled to it in the first place.
-			log.WithFields(flds).Warn("pod unschedulable despite being scheduled to this node")
+			node := state.Nodes[nodeName]
+			log.WithFields(flds).Warnf("pod unschedulable despite being scheduled to this node: %s", DebugStringNodes(node))
+
+			rgs := make([]string, 0, len(reservedGhosts))
+			for k := range reservedGhosts {
+				rgs = append(rgs, k)
+			}
+			log.WithFields(flds).Warnf("reservedGhosts: %s", strings.Join(rgs, ", "))
+
+			pds := make([]string, 0, len(node.Pods))
+			for _, p := range node.Pods {
+				pds = append(pds, p.Name)
+			}
+			log.WithFields(flds).Warnf("pods: %s", strings.Join(pds, ", "))
+
+			gs := make([]string, 0, len(node.Ghosts))
+			for _, g := range node.Ghosts {
+				gs = append(gs, g.Name)
+			}
+			log.WithFields(flds).Warnf("ghosts: %s", strings.Join(gs, ", "))
 
 			// drop scheduling request for now - but make sure we revisit it later
 			s.queue.AddUnschedulable(pi)
