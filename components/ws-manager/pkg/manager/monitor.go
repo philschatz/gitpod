@@ -25,7 +25,6 @@ import (
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	wsdaemon "github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
-	"github.com/gitpod-io/gitpod/ws-manager/pkg/internal/util"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,13 +71,10 @@ type Monitor struct {
 	startup time.Time
 
 	manager   *Manager
-	podwatch  watch.Interface
-	cfgwatch  watch.Interface
 	eventpool *workpool.EventWorkerPool
 	ticker    *time.Ticker
 
-	doShutdown  util.AtomicBool
-	didShutdown chan bool
+	doShutdown chan bool
 
 	inPhaseSpans     map[string]opentracing.Span
 	inPhaseSpansLock sync.Mutex
@@ -112,7 +108,7 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 		probeMap:         make(map[string]context.CancelFunc),
 		initializerMap:   make(map[string]struct{}),
 		finalizerMap:     make(map[string]context.CancelFunc),
-		didShutdown:      make(chan bool, 1),
+		doShutdown:       make(chan bool, 1),
 		headlessListener: NewHeadlessListener(m.Clientset, m.Config.Namespace),
 
 		OnError: func(err error) {
@@ -213,26 +209,6 @@ func containsWorkspaceAnnotaion(obj interface{}) bool {
 	return hasAnnotation
 }
 
-func (m *Monitor) connectToPodWatch() error {
-	podwatch, err := m.manager.Clientset.CoreV1().Pods(m.manager.Config.Namespace).Watch(context.Background(), workspaceObjectListOptions())
-	if err != nil {
-		return xerrors.Errorf("cannot watch pods: %w", err)
-	}
-
-	m.podwatch = podwatch
-	return nil
-}
-
-func (m *Monitor) connectToConfigMapWatch() error {
-	cfgwatch, err := m.manager.Clientset.CoreV1().ConfigMaps(m.manager.Config.Namespace).Watch(context.Background(), workspaceObjectListOptions())
-	if err != nil {
-		return xerrors.Errorf("cannot watch config maps: %w", err)
-	}
-
-	m.cfgwatch = cfgwatch
-	return nil
-}
-
 // Start starts up the monitor which will check the overall workspace state (on event or periodically).
 // Use Stop() to stop the monitor gracefully.
 func (m *Monitor) Start() error {
@@ -240,121 +216,53 @@ func (m *Monitor) Start() error {
 	m.startup = time.Now().UTC()
 
 	m.eventpool.Start(eventpoolWorkers)
-	err := m.connectToPodWatch()
-	if err != nil {
-		return xerrors.Errorf("cannot start workspace monitor: %w", err)
-	}
-	err = m.connectToConfigMapWatch()
-	if err != nil {
-		return xerrors.Errorf("cannot start workspace monitor: %w", err)
-	}
 
 	// our activity state is ephemeral and as such we need to mark existing workspaces active after we have
 	// restarted (i.e. cleared our state). If we didn't do this, we'd time out all workspaces at ws-manager
 	// startup, see: https://github.com/gitpod-io/gitpod/issues/2537 and https://github.com/gitpod-io/gitpod/issues/2619
-	err = m.manager.markAllWorkspacesActive()
+	err := m.manager.markAllWorkspacesActive()
 	if err != nil {
 		log.WithError(err).Warn("cannot mark all existing workspaces active - this will wrongly time out user's workspaces")
 	}
 
 	go func() {
 		// we'll keep running until we're shut down
-		for !m.shouldShutdown() {
-			// make the monitor run
-			m.run()
-			// we've come out of the run loop - must mean we got disconnected
-			log.Info("connection to Kubernetes master lost")
-
-			reconnectionInterval := time.Duration(m.manager.Config.ReconnectionInterval)
-			if reconnectionInterval == 0 {
-				reconnectionInterval = 1 * time.Second
-			}
-			// we got disconnected but don't want to shutdown - reconnect until we succeed
-			for reconnected := false; !reconnected && !m.shouldShutdown(); {
-				log := log.WithField("watch", "pods")
-
-				err := m.connectToPodWatch()
-				if err != nil {
-					log.WithError(err).Warn("monitor cannot reconnect to Kubernetes - will try again")
-					time.Sleep(reconnectionInterval)
-					continue
-				}
-
-				log.Info("connection to Kubernetes master is reestablished")
-				reconnected = true
-			}
-			for reconnected := false; !reconnected && !m.shouldShutdown(); {
-				log := log.WithField("watch", "configmaps")
-
-				err := m.connectToConfigMapWatch()
-				if err != nil {
-					log.WithError(err).Warn("monitor cannot reconnect to Kubernetes - will try again")
-					time.Sleep(reconnectionInterval)
-					continue
-				}
-
-				log.Info("connection to Kubernetes master is reestablished")
-				reconnected = true
-			}
-
-			if m.shouldShutdown() {
+		for {
+			select {
+			case <-m.doShutdown:
 				// we're asked to shut down - let's do this gracefully
 				log.Debug("monitor was asked to shut down - ended main loop")
 				m.eventpool.Stop()
-				m.didShutdown <- true
 				return
+			case <-m.ticker.C:
+				go m.doHousekeeping(context.Background())
 			}
 		}
 	}()
+
 	return nil
 }
 
-// run checks the overall workspace state (on event or periodically). Run is best called as a goroutine.
-// Note: this function serializes the handling of pod/config map events per workspace, but not globally.
-func (m *Monitor) run() {
-	continueListening := true
-	for continueListening {
-		if m.podwatch == nil || m.cfgwatch == nil || m.ticker == nil || m.shouldShutdown() {
-			// we got shut down
-			return
-		}
-
-		select {
-		case evt := <-m.podwatch.ResultChan():
-			continueListening = m.enqueueEvent(evt)
-		case evt := <-m.cfgwatch.ResultChan():
-			continueListening = m.enqueueEvent(evt)
-		case <-m.ticker.C:
-			go m.doHousekeeping(context.Background())
-		}
-	}
-}
-
 // enqueueEvent adds the event to the appropriate queue in the event pool
-func (m *Monitor) enqueueEvent(evt watch.Event) (continueListening bool) {
-	if evt.Type == watch.Error || evt.Object == nil {
-		// we got disconnected from Kubernetes
-		return false
-	}
-
-	continueListening = true
-
+func (m *Monitor) enqueueEvent(evt watch.Event) {
 	var queue string
+
 	pod, ok := evt.Object.(*corev1.Pod)
 	if ok {
 		queue = pod.Annotations[workspaceIDAnnotation]
 	}
+
 	cfgmap, ok := evt.Object.(*corev1.ConfigMap)
 	if ok {
 		queue = cfgmap.Annotations[workspaceIDAnnotation]
 	}
+
 	if queue == "" {
 		m.OnError(xerrors.Errorf("event object has no name: %v", evt))
 		return
 	}
 
 	m.eventpool.Add(queue, evt)
-	return
 }
 
 // handleEvent dispatches an event to the corresponding event handler based on the event object kind.
@@ -1598,22 +1506,12 @@ func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 
 // Stop ends the monitor's involvement. A stopped monitor cannot be started again.
 func (m *Monitor) Stop() {
-	m.doShutdown.Set(true)
-
-	if m.podwatch != nil {
-		m.podwatch.Stop()
-	}
 	if m.ticker != nil {
 		m.ticker.Stop()
 	}
 
-	<-m.didShutdown
-	m.podwatch = nil
+	m.doShutdown <- true
 	m.ticker = nil
-}
-
-func (m *Monitor) shouldShutdown() bool {
-	return m.doShutdown.Get()
 }
 
 func workspaceObjectListOptions() metav1.ListOptions {
