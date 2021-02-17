@@ -29,7 +29,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/alecthomas/repr"
 	"github.com/golang/protobuf/proto"
@@ -124,6 +127,55 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 		}
 	}
 	res.eventpool = workpool.NewEventWorkerPool(res.handleEvent)
+
+	m.StateHolder.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			res.enqueueEvent(watch.Event{
+				Type:   watch.Added,
+				Object: obj.(runtime.Object),
+			})
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if reflect.DeepEqual(oldObj, newObj) {
+				return
+			}
+
+			res.enqueueEvent(watch.Event{
+				Type:   watch.Modified,
+				Object: newObj.(runtime.Object),
+			})
+		},
+		DeleteFunc: func(obj interface{}) {
+			ro, ok := obj.(runtime.Object)
+
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %+v", obj))
+					return
+				}
+
+				_, ok = tombstone.Obj.(runtime.Object)
+				if !ok {
+					utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a vc %+v", obj))
+					return
+				}
+
+				return
+			}
+
+			_, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			if err != nil {
+				utilruntime.HandleError(err)
+				return
+			}
+
+			res.enqueueEvent(watch.Event{
+				Type:   watch.Deleted,
+				Object: ro,
+			})
+		},
+	})
 
 	return &res, nil
 }
@@ -1357,28 +1409,27 @@ func (m *Monitor) deleteDanglingServices(ctx context.Context) error {
 
 // deleteDanglingPodLifecycleIndependentState removes PLIS config maps for which no pod exists and which have exceded lonelyPLISSurvivalTime
 func (m *Monitor) deleteDanglingPodLifecycleIndependentState(ctx context.Context) error {
-	pods, err := m.manager.Clientset.CoreV1().Pods(m.manager.Config.Namespace).List(ctx, workspaceObjectListOptions())
+	pods, err := m.manager.StateHolder.PodsWithListOptions(workspaceObjectListOptions())
 	if err != nil {
 		return xerrors.Errorf("deleteDanglingPodLifecycleIndependentState: %w", err)
 	}
 	podIdx := make(map[string]*corev1.Pod)
-	for _, p := range pods.Items {
+	for _, p := range pods {
 		workspaceID, ok := p.Labels[wsk8s.WorkspaceIDLabel]
 		if !ok {
 			log.WithFields(wsk8s.GetOWIFromObject(&p.ObjectMeta)).WithField("pod", p).Warn("found workspace object pod without workspaceID label")
 			continue
 		}
 
-		podIdx[workspaceID] = &p
+		podIdx[workspaceID] = p
 	}
 
-	cfgmapsClient := m.manager.Clientset.CoreV1().ConfigMaps(m.manager.Config.Namespace)
-	plisConfigmaps, err := cfgmapsClient.List(ctx, workspaceObjectListOptions())
+	plisConfigmaps, err := m.manager.StateHolder.ConfigMapsWithListOptions(workspaceObjectListOptions())
 	if err != nil {
 		return xerrors.Errorf("deleteDanglingPodLifecycleIndependentState: %w", err)
 	}
 
-	for _, cfgmap := range plisConfigmaps.Items {
+	for _, cfgmap := range plisConfigmaps {
 		workspaceID, ok := cfgmap.Labels[wsk8s.WorkspaceIDLabel]
 		if !ok {
 			m.OnError(xerrors.Errorf("PLIS config map %s does not have %s label", cfgmap.Name, wsk8s.WorkspaceIDLabel))
@@ -1391,7 +1442,7 @@ func (m *Monitor) deleteDanglingPodLifecycleIndependentState(ctx context.Context
 		}
 
 		referenceTime := cfgmap.CreationTimestamp.Time
-		plis, err := unmarshalPodLifecycleIndependentState(&cfgmap)
+		plis, err := unmarshalPodLifecycleIndependentState(cfgmap)
 		if err != nil {
 			m.OnError(xerrors.Errorf("cannot get PLIS configmap age: %w", err))
 			continue
@@ -1409,6 +1460,7 @@ func (m *Monitor) deleteDanglingPodLifecycleIndependentState(ctx context.Context
 		//       Prior to deletion we should send a final stopped update.
 
 		propagationPolicy := metav1.DeletePropagationForeground
+		cfgmapsClient := m.manager.Clientset.CoreV1().ConfigMaps(m.manager.Config.Namespace)
 		err = cfgmapsClient.Delete(ctx, cfgmap.Name, metav1.DeleteOptions{PropagationPolicy: &propagationPolicy})
 		if err != nil {
 			m.OnError(xerrors.Errorf("cannot delete too old PLIS config map: %w", err))
@@ -1425,14 +1477,14 @@ func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 	span, ctx := tracing.FromContext(ctx, "markTimedoutWorkspaces")
 	defer tracing.FinishSpan(span, nil)
 
-	pods, err := m.manager.Clientset.CoreV1().Pods(m.manager.Config.Namespace).List(ctx, workspaceObjectListOptions())
+	pods, err := m.manager.StateHolder.PodsWithListOptions(workspaceObjectListOptions())
 	if err != nil {
 		return xerrors.Errorf("stopTimedoutWorkspaces: %w", err)
 	}
 
 	errs := make([]string, 0)
 	idx := make(map[string]struct{})
-	for _, pod := range pods.Items {
+	for _, pod := range pods {
 		workspaceID, ok := pod.Annotations[workspaceIDAnnotation]
 		if !ok {
 			log.WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).WithError(err).Errorf("while checking if timed out: found workspace without %s annotation", workspaceIDAnnotation)
@@ -1446,7 +1498,7 @@ func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 			continue
 		}
 
-		timedout, err := m.manager.isWorkspaceTimedOut(workspaceObjects{Pod: &pod})
+		timedout, err := m.manager.isWorkspaceTimedOut(workspaceObjects{Pod: pod})
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("workspaceId=%s: %q", workspaceID, err))
 			continue
@@ -1462,11 +1514,11 @@ func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 	}
 
 	// timeout PLIS only workspaces
-	allPlis, err := m.manager.Clientset.CoreV1().ConfigMaps(m.manager.Config.Namespace).List(ctx, workspaceObjectListOptions())
+	allPlis, err := m.manager.StateHolder.ConfigMapsWithListOptions(workspaceObjectListOptions())
 	if err != nil {
 		return xerrors.Errorf("stopTimedoutWorkspaces: %w", err)
 	}
-	for _, plis := range allPlis.Items {
+	for _, plis := range allPlis {
 		workspaceID, ok := plis.Annotations[workspaceIDAnnotation]
 		if !ok {
 			log.WithFields(wsk8s.GetOWIFromObject(&plis.ObjectMeta)).WithError(err).Errorf("while checking if timed out: found workspace PLIS without %s annotation", workspaceIDAnnotation)
@@ -1479,7 +1531,7 @@ func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 			continue
 		}
 
-		timedout, err := m.manager.isWorkspaceTimedOut(workspaceObjects{PLIS: &plis})
+		timedout, err := m.manager.isWorkspaceTimedOut(workspaceObjects{PLIS: plis})
 		if xerrors.Is(err, errNoPLIS) {
 			// The pod is gone and the PLIS hasn't been patched yet - there's not much we can do here, except
 			// to ignore the workspace.
