@@ -11,6 +11,7 @@ import (
 
 	ctesting "github.com/gitpod-io/gitpod/common-go/testing"
 	"github.com/gitpod-io/gitpod/common-go/util"
+	kubestate "github.com/gitpod-io/gitpod/ws-manager/pkg/manager/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -63,6 +64,14 @@ func TestDeleteDanglingPodLifecycleIndependentState(t *testing.T) {
 				objs = append(objs, fixture.PLIS)
 			}
 			manager := forTestingOnlyGetManager(t, objs...)
+
+			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
+			defer cancel()
+
+			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
+			stateHolder.Run(ctx.Done())
+
+			manager.StateHolder = stateHolder
 
 			monitor, err := manager.CreateMonitor()
 			if err != nil {

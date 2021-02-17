@@ -10,8 +10,9 @@ import (
 
 	ctesting "github.com/gitpod-io/gitpod/common-go/testing"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
+	kubestate "github.com/gitpod-io/gitpod/ws-manager/pkg/manager/state"
+
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 )
@@ -94,17 +95,23 @@ func TestControlPort(t *testing.T) {
 			manager.OnChange = func(ctx context.Context, status *api.WorkspaceStatus) {
 				result.PostChangeStatus = status.Spec.ExposedPorts
 			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
+			defer cancel()
+
+			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
+			stateHolder.Run(ctx.Done())
+
+			manager.StateHolder = stateHolder
+
 			resp, err := manager.ControlPort(context.Background(), &fixture.Request)
 			if err != nil {
 				result.Error = err.Error()
 				return &result
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
-			defer cancel()
-
 			result.Response = resp
-			result.PortsService, _ = manager.Clientset.CoreV1().Services(manager.Config.Namespace).Get(ctx, getPortsServiceName(startCtx.Request.ServicePrefix), metav1.GetOptions{})
+			result.PortsService, _ = manager.StateHolder.GetService(getPortsServiceName(startCtx.Request.ServicePrefix))
 
 			return &result
 		},
@@ -139,6 +146,15 @@ func TestGetWorkspaces(t *testing.T) {
 			}
 
 			manager := forTestingOnlyGetManager(t, obj...)
+
+			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
+			defer cancel()
+
+			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
+			stateHolder.Run(ctx.Done())
+
+			manager.StateHolder = stateHolder
+
 			resp, err := manager.GetWorkspaces(context.Background(), &api.GetWorkspacesRequest{})
 
 			var result gold
@@ -217,6 +233,14 @@ func TestFindWorkspacePod(t *testing.T) {
 				objs = append(objs, pod)
 			}
 			manager.Clientset = fakek8s.NewSimpleClientset(objs...)
+
+			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
+			defer cancel()
+
+			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
+			stateHolder.Run(ctx.Done())
+
+			manager.StateHolder = stateHolder
 
 			p, err := manager.findWorkspacePod(context.Background(), test.WorkspaceID)
 
