@@ -130,6 +130,10 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 
 	m.StateHolder.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			if !shouldNotifyEvent(obj) {
+				return
+			}
+
 			res.enqueueEvent(watch.Event{
 				Type:   watch.Added,
 				Object: obj.(runtime.Object),
@@ -137,6 +141,10 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			if reflect.DeepEqual(oldObj, newObj) {
+				return
+			}
+
+			if !shouldNotifyEvent(newObj) {
 				return
 			}
 
@@ -164,6 +172,10 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 				return
 			}
 
+			if !shouldNotifyEvent(obj) {
+				return
+			}
+
 			_, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err != nil {
 				utilruntime.HandleError(err)
@@ -178,6 +190,27 @@ func (m *Manager) CreateMonitor() (*Monitor, error) {
 	})
 
 	return &res, nil
+}
+
+func shouldNotifyEvent(obj interface{}) bool {
+	switch obj.(type) {
+	case *corev1.Pod:
+		return containsWorkspaceAnnotaion(obj)
+	case *corev1.ConfigMap:
+		return containsWorkspaceAnnotaion(obj)
+	default:
+		return false
+	}
+}
+
+func containsWorkspaceAnnotaion(obj interface{}) bool {
+	ro, ok := obj.(metav1.ObjectMetaAccessor)
+	if !ok {
+		return false
+	}
+
+	_, hasAnnotation := ro.GetObjectMeta().GetAnnotations()[workspaceIDAnnotation]
+	return hasAnnotation
 }
 
 func (m *Monitor) connectToPodWatch() error {
