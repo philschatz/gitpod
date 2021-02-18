@@ -48,11 +48,6 @@ func NewStateHolder(namespace string, resyncPeriod time.Duration, clientset kube
 
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, resyncPeriod,
 		informers.WithNamespace(namespace),
-		/*
-			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-				options.LabelSelector = ""
-			})
-		*/
 	)
 
 	store.informers.ConfigMap = informerFactory.Core().V1().ConfigMaps().Informer()
@@ -170,8 +165,12 @@ func (sh stateHolder) Run(stopCh <-chan struct{}) {
 }
 
 func getObjectKey(input, defNs string) string {
+	if defNs == "" {
+		defNs = "default"
+	}
+
 	nsName := strings.Split(input, "/")
-	if len(nsName) == 0 {
+	if len(nsName) == 1 {
 		return fmt.Sprintf("%v/%v", defNs, input)
 	}
 
