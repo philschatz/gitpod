@@ -7,14 +7,17 @@ package manager
 import (
 	"context"
 	"testing"
+	"time"
 
 	ctesting "github.com/gitpod-io/gitpod/common-go/testing"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
 	kubestate "github.com/gitpod-io/gitpod/ws-manager/pkg/manager/state"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestValidateStartWorkspaceRequest(t *testing.T) {
@@ -49,7 +52,7 @@ func TestValidateStartWorkspaceRequest(t *testing.T) {
 }
 
 func TestControlPort(t *testing.T) {
-	t.Skipf("pass tests")
+	t.Skip("pass tests")
 
 	type fixture struct {
 		PortsService *corev1.Service        `json:"portsService,omitempty"`
@@ -76,41 +79,64 @@ func TestControlPort(t *testing.T) {
 				manager.Config.WorkspacePortURLTemplate = "{{ .Host }}:{{ .IngressPort }}"
 			}
 
+			clientset := fakek8s.NewSimpleClientset()
+			manager.Clientset = clientset
 			manager.Config.Namespace = "default"
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
+			stateHolder.AddEventHandler(cache.ResourceEventHandlerFuncs{
+				UpdateFunc: func(oldObj, newObj interface{}) {
+					t.Logf("[Object update]: %v", newObj)
+				},
+			})
+
+			stateHolder.Run(ctx.Done())
+
+			manager.StateHolder = stateHolder
+
 			startCtx, err := forTestingOnlyCreateStartWorkspaceContext(manager, fixture.Request.Id, api.WorkspaceType_REGULAR)
 			if err != nil {
 				t.Errorf("cannot create test pod start context; this is a bug in the unit test itself: %v", err)
 				return nil
 			}
+
 			pod, err := manager.createDefiniteWorkspacePod(startCtx)
 			if err != nil {
 				t.Errorf("cannot create test pod; this is a bug in the unit test itself: %v", err)
 				return nil
 			}
-			state := []runtime.Object{pod}
-			if fixture.PortsService != nil {
-				state = append(state, fixture.PortsService)
+
+			_, err = clientset.CoreV1().Pods(manager.Config.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+			if err != nil {
+				t.Errorf("cannot create pod: %v", err)
+				return nil
 			}
 
+			if fixture.PortsService != nil {
+				_, err = clientset.CoreV1().Services(manager.Config.Namespace).Create(context.Background(), fixture.PortsService, metav1.CreateOptions{})
+				if err != nil {
+					t.Errorf("cannot create service: %v", err)
+					return nil
+				}
+			}
+
+			time.Sleep(1 * time.Second)
+
 			var result gold
-			manager.Clientset = fakek8s.NewSimpleClientset(state...)
 			manager.OnChange = func(ctx context.Context, status *api.WorkspaceStatus) {
 				result.PostChangeStatus = status.Spec.ExposedPorts
 			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), kubernetesOperationTimeout)
-			defer cancel()
-
-			stateHolder := kubestate.NewStateHolder(manager.Config.Namespace, 0, manager.Clientset)
-			stateHolder.Run(ctx.Done())
-
-			manager.StateHolder = stateHolder
 
 			resp, err := manager.ControlPort(context.Background(), &fixture.Request)
 			if err != nil {
 				result.Error = err.Error()
 				return &result
 			}
+
+			time.Sleep(1 * time.Second)
 
 			result.Response = resp
 			result.PortsService, _ = manager.StateHolder.GetService(getPortsServiceName(startCtx.Request.ServicePrefix))
