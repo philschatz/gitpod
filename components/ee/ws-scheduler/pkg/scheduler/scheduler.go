@@ -749,7 +749,7 @@ func SortByPriority(pi1, pi2 *QueuedPodInfo) bool {
 	now := time.Now()
 	p1 := podPriority(pi1.Pod, now)
 	p2 := podPriority(pi2.Pod, now)
-	return p1 > p2
+	return p1 < p2
 }
 
 // podPriority calculates the priority a pod gets in our scheduling queue.
