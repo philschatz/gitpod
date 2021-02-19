@@ -70,6 +70,9 @@ const (
 	reasonOutOfMemory = "outofmemory"
 )
 
+type BindPodToNodeFunc = func(ctx context.Context, pod *corev1.Pod, nodeName string, createEventFn CreateEventFunc) error
+type CreateEventFunc = func(ctx context.Context, namespace string, event *corev1.Event, opts metav1.CreateOptions) error
+
 // Scheduler tries to pack workspaces as closely as possible while trying to keep
 // an even load across nodes.
 type Scheduler struct {
@@ -123,6 +126,14 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	// Start the actual scheduling loop. This is the only caller of schedulePod to ensure it's atomicity
 	go func(q *PriorityQueue) {
+		bindPodToNode := func(ctx context.Context, pod *corev1.Pod, nodeName string, createEventFn CreateEventFunc) error {
+			return s.bindPodToNode(ctx, pod, nodeName, createEventFn)
+		}
+		createEvent := func(ctx context.Context, namespace string, event *corev1.Event, opts metav1.CreateOptions) error {
+			_, err := s.Clientset.CoreV1().Events(namespace).Create(ctx, event, opts)
+			return err
+		}
+
 		for {
 			pi, wasClosed := q.Pop()
 			if wasClosed {
@@ -130,8 +141,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 			pod := pi.Pod
-
-			err := s.schedulePod(ctx, pi)
+			err := s.schedulePod(ctx, pi, bindPodToNode, createEvent)
 			if err != nil {
 				log.WithError(err).WithField("pod", pod.Name).Error("unable to schedule pod")
 			}
@@ -260,7 +270,9 @@ func (s *Scheduler) WaitForShutdown() {
 
 // schedulePod is the central method here, it orchestrates the actual scheduling of a pod onto a node.
 // It's expected to be atomic as there's a single goroutine working through the schedulingQueue calling this.
-func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err error) {
+//
+// Some interaction with the k8s plane is extracted into functions to allow testing
+func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo, bindPodToNodeFn BindPodToNodeFunc, createEventFn CreateEventFunc) (err error) {
 	start := time.Now()
 
 	pod := pi.Pod
@@ -305,7 +317,7 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 		} else {
 			errMsg = "no suitable node found"
 		}
-		err = s.recordSchedulingFailure(ctx, pod, err, corev1.PodReasonUnschedulable, errMsg)
+		err = s.recordSchedulingFailure(ctx, pod, err, corev1.PodReasonUnschedulable, errMsg, createEventFn)
 		if err != nil {
 			metrics.PodScheduleError(workspaceType, metrics.SinceInSeconds(start))
 			return xerrors.Errorf("cannot record scheduling failure: %w", err)
@@ -366,6 +378,9 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 	// reserve the slot, even before the actual scheduling has happened.
 	// We persists this info between scheduling runs (as long as the pod is in the queue).
 	// We just need to make sure we release the slot in case the scheduling fails!
+	//
+	// Note: For this "early reservation" to work properly we rely on the fact that pods for which
+	//       "isGhostReplacing" == true always have a higher priority than ghosts!
 	s.localSlotCache.reserveSlot(pod, nodeName, ghostToDelete)
 	defer func() {
 		if err != nil {
@@ -376,21 +391,23 @@ func (s *Scheduler) schedulePod(ctx context.Context, pi *QueuedPodInfo) (err err
 
 	// if this is a workspace that replaces a ghost: delete that ghost to make room for a workspace in a later scheduling round
 	if ghostToDelete != "" {
-		defer metrics.PreemptionAttempts.Inc()
+		// only delete the ghost and park the scheduling request for later
+		s.queue.AddUnschedulable(pi)
 
 		err = s.deleteGhostWorkspace(ctx, pod.Name, ghostToDelete)
 		if err != nil {
 			log.WithFields(flds).WithField("ghost", ghostToDelete).WithError(err).Error("error deleting ghost")
 		}
 
-		// only delete the ghost and drop scheduling request for now - but make sure we revisit it later
-		s.queue.AddUnschedulable(pi)
+		// metrics
+		metrics.PreemptionAttempts.Inc()
 		metrics.PodUnschedulable(workspaceType, metrics.SinceInSeconds(start))
+
 		return
 	}
 
 	// bind the pod to the node
-	err = s.bindPodToNode(ctx, pod, nodeName)
+	err = bindPodToNodeFn(ctx, pod, nodeName, createEventFn)
 	if err != nil {
 		errStr := err.Error()
 		if strings.Contains(errStr, "is already assigned to node") {
@@ -543,7 +560,7 @@ func (s *Scheduler) gatherPotentialNodesFor(ctx context.Context, pod *corev1.Pod
 	return potentialNodes, nil
 }
 
-func (s *Scheduler) bindPodToNode(ctx context.Context, pod *corev1.Pod, nodeName string) (err error) {
+func (s *Scheduler) bindPodToNode(ctx context.Context, pod *corev1.Pod, nodeName string, createEventsFn CreateEventFunc) (err error) {
 	//nolint:ineffassign
 	span, ctx := tracing.FromContext(ctx, "bindPodToNode")
 	defer tracing.FinishSpan(span, nil) // let caller decide whether this is an actual error or not
@@ -572,7 +589,7 @@ func (s *Scheduler) bindPodToNode(ctx context.Context, pod *corev1.Pod, nodeName
 	// This is not really neccesary for the scheduling itself, but helps to debug things.
 	message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", pod.Namespace, pod.Name, nodeName)
 	timestamp := time.Now().UTC()
-	_, err = s.Clientset.CoreV1().Events(pod.Namespace).Create(ctx, &corev1.Event{
+	err = createEventsFn(ctx, pod.Namespace, &corev1.Event{
 		Count:          1,
 		Message:        message,
 		Reason:         "Scheduled",
@@ -624,7 +641,7 @@ func (s *Scheduler) waitForCacheSync(ctx context.Context) bool {
 	}
 }
 
-func (s *Scheduler) recordSchedulingFailure(ctx context.Context, pod *corev1.Pod, failureErr error, reason string, message string) (err error) {
+func (s *Scheduler) recordSchedulingFailure(ctx context.Context, pod *corev1.Pod, failureErr error, reason string, message string, createEventFn CreateEventFunc) (err error) {
 	//nolint:ineffassign
 	span, ctx := tracing.FromContext(ctx, "recordSchedulingFailure")
 	defer tracing.FinishSpan(span, &err)
@@ -645,7 +662,7 @@ func (s *Scheduler) recordSchedulingFailure(ctx context.Context, pod *corev1.Pod
 	}).WithError(failureErr).Warnf("scheduling a pod failed: %s", reason)
 
 	timestamp := time.Now().UTC()
-	_, err = s.Clientset.CoreV1().Events(pod.Namespace).Create(ctx, &corev1.Event{
+	err = createEventFn(ctx, pod.Namespace, &corev1.Event{
 		Count:          1,
 		Message:        message,
 		Reason:         "FailedScheduling",
@@ -673,7 +690,7 @@ func (s *Scheduler) recordSchedulingFailure(ctx context.Context, pod *corev1.Pod
 	// Note: Do _not_ retry.RetryOnConflict here as:
 	//  - this is on the hot path of the single-thread scheduler
 	//  - retry would block other pods from being scheduled
-	//  - the pod is picked up after rescheduleInterval (currently 2s) again anyway
+	//  - the pod is picked up again anyway
 	updatedPod, err := s.Clientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		log.WithField("pod", pod.Name).WithError(err).Warn("cannot get updated pod - subsequent pod modifications may break")
