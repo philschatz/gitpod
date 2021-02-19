@@ -5,6 +5,7 @@ packages:
       - "*.proto"
     config:
       commands:
-        - ["git", "clone", "https://github.com/grpc-ecosystem/grpc-gateway"]
-        - ["mv", "grpc-gateway/third_party", "third_party"]
-        - ["rm", "-r", "grpc-gateway"]
+        - ["git", "clone", "https://github.com/googleapis/googleapis"]
+        - ["mkdir", "third_party"]
+        - ["rm", "-r", "googleapis/.git"]
+        - ["mv", "googleapis", "third_party"]
