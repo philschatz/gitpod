@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
+	testingk8s "k8s.io/client-go/testing"
 )
 
 var (
@@ -23,19 +24,11 @@ var (
 	testNamespace = "default"
 )
 
-type SchedulingResultKind string
-
-const (
-	resultBound              SchedulingResultKind = "bound"
-	resultUnbound            SchedulingResultKind = "unbound"
-	resultNotEnoughResources SchedulingResultKind = "notEnoughResources"
-)
-
-type SchedulingResult struct {
-	Kind         SchedulingResultKind
+type ExpectedSchedulingResult struct {
+	Result       SchedulingResult
 	DeletedGhost string
 }
-type Expectation = map[string]SchedulingResult
+type Expectation = map[string]ExpectedSchedulingResult
 
 func TestSchedulePod(t *testing.T) {
 	tests := []struct {
@@ -60,10 +53,10 @@ func TestSchedulePod(t *testing.T) {
 			Expectations: []Expectation{
 				{
 					"ws1": {
-						Kind: resultBound,
+						Result: resultBound,
 					},
 					"ws2": {
-						Kind: resultBound,
+						Result: resultBound,
 					},
 				},
 			},
@@ -86,16 +79,16 @@ func TestSchedulePod(t *testing.T) {
 			Expectations: []Expectation{
 				{
 					"ws1": {
-						Kind: resultBound,
+						Result: resultBound,
 					},
 					"ws2": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost3",
 					},
 				},
 				{
 					"ws2": {
-						Kind: resultBound,
+						Result: resultBound,
 					},
 				},
 			},
@@ -122,88 +115,88 @@ func TestSchedulePod(t *testing.T) {
 			Expectations: []Expectation{
 				{
 					"ws5": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost5",
 					},
 					"ws4": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost4",
 					},
 					"ws3": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost3",
 					},
 					"ws2": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost2",
 					},
 					"ws1": {
-						Kind:         resultUnbound,
+						Result:       resultWaitingForGhost,
 						DeletedGhost: "ghost1",
 					},
 				},
 			},
 		},
-		// {
-		// 	Desc: "replace all ghosts, but still not enough space",
-		// 	Nodes: []*corev1.Node{
-		// 		createTNode("node1", "11000Mi"),
-		// 	},
-		// 	AssignedPods: []*corev1.Pod{
-		// 		createWorkspacePod("ws0", "2000Mi", "node1", corev1.PodRunning, "100s"),
-		// 		createGhostPod("ghost1", "2000Mi", "node1", corev1.PodRunning, "101s"),
-		// 		createGhostPod("ghost2", "2000Mi", "node1", corev1.PodRunning, "102s"),
-		// 		createGhostPod("ghost3", "2000Mi", "node1", corev1.PodRunning, "103s"),
-		// 		createGhostPod("ghost4", "2000Mi", "node1", corev1.PodRunning, "104s"),
-		// 	},
-		// 	QueuedPods: []*corev1.Pod{
-		// 		createWorkspacePod("ws1", "2000Mi", "", corev1.PodPending, "11s"),
-		// 		createWorkspacePod("ws2", "2000Mi", "", corev1.PodPending, "12s"),
-		// 		createWorkspacePod("ws3", "2000Mi", "", corev1.PodPending, "13s"),
-		// 		createWorkspacePod("ws4", "2000Mi", "", corev1.PodPending, "14s"),
-		// 		createWorkspacePod("ws5", "2000Mi", "", corev1.PodPending, "15s"),
-		// 	},
-		// 	Expectations: []map[string]SchedulingResult{
-		// 		{
-		// 			"ws5": {
-		// 				Kind:         resultUnbound,
-		// 				DeletedGhost: "ghost4",
-		// 			},
-		// 			"ws4": {
-		// 				Kind:         resultUnbound,
-		// 				DeletedGhost: "ghost3",
-		// 			},
-		// 			"ws3": {
-		// 				Kind:         resultUnbound,
-		// 				DeletedGhost: "ghost2",
-		// 			},
-		// 			"ws2": {
-		// 				Kind:         resultUnbound,
-		// 				DeletedGhost: "ghost1",
-		// 			},
-		// 			"ws1": {
-		// 				Kind: resultNotEnoughResources,
-		// 			},
-		// 		},
-		// 		{
-		// 			"ws5": {
-		// 				Kind: resultBound,
-		// 			},
-		// 			"ws4": {
-		// 				Kind: resultBound,
-		// 			},
-		// 			"ws3": {
-		// 				Kind: resultBound,
-		// 			},
-		// 			"ws2": {
-		// 				Kind: resultBound,
-		// 			},
-		// 			"ws1": {
-		// 				Kind: resultNotEnoughResources,
-		// 			},
-		// 		},
-		// 	},
-		// },
+		{
+			Desc: "replace all ghosts, but still not enough space",
+			Nodes: []*corev1.Node{
+				createTNode("node1", "11000Mi"),
+			},
+			AssignedPods: []*corev1.Pod{
+				createWorkspacePod("ws0", "2000Mi", "node1", corev1.PodRunning, "100s"),
+				createGhostPod("ghost1", "2000Mi", "node1", corev1.PodRunning, "101s"),
+				createGhostPod("ghost2", "2000Mi", "node1", corev1.PodRunning, "102s"),
+				createGhostPod("ghost3", "2000Mi", "node1", corev1.PodRunning, "103s"),
+				createGhostPod("ghost4", "2000Mi", "node1", corev1.PodRunning, "104s"),
+			},
+			QueuedPods: []*corev1.Pod{
+				createWorkspacePod("ws1", "2000Mi", "", corev1.PodPending, "11s"),
+				createWorkspacePod("ws2", "2000Mi", "", corev1.PodPending, "12s"),
+				createWorkspacePod("ws3", "2000Mi", "", corev1.PodPending, "13s"),
+				createWorkspacePod("ws4", "2000Mi", "", corev1.PodPending, "14s"),
+				createWorkspacePod("ws5", "2000Mi", "", corev1.PodPending, "15s"),
+			},
+			Expectations: []map[string]ExpectedSchedulingResult{
+				{
+					"ws5": {
+						Result:       resultWaitingForGhost,
+						DeletedGhost: "ghost4",
+					},
+					"ws4": {
+						Result:       resultWaitingForGhost,
+						DeletedGhost: "ghost3",
+					},
+					"ws3": {
+						Result:       resultWaitingForGhost,
+						DeletedGhost: "ghost2",
+					},
+					"ws2": {
+						Result:       resultWaitingForGhost,
+						DeletedGhost: "ghost1",
+					},
+					"ws1": {
+						Result: resultUnschedulable,
+					},
+				},
+				{
+					"ws5": {
+						Result: resultBound,
+					},
+					"ws4": {
+						Result: resultBound,
+					},
+					"ws3": {
+						Result: resultBound,
+					},
+					"ws2": {
+						Result: resultBound,
+					},
+					"ws1": {
+						Result: resultUnschedulable,
+					},
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.Desc, func(t *testing.T) {
@@ -220,6 +213,20 @@ func TestSchedulePod(t *testing.T) {
 			}
 
 			client := fakek8s.NewSimpleClientset(objs...)
+			// we want to make sure all Pod.Delete operation happen when we want them to happen
+			lockDeletes := true
+			lockStepDeletes := []string{}
+			lockStepDeleteReactor := func(action testingk8s.Action) (handled bool, ret runtime.Object, err error) {
+				if !lockDeletes {
+					return false, nil, nil
+				}
+
+				name := action.(testingk8s.DeleteAction).GetName()
+				lockStepDeletes = append(lockStepDeletes, name)
+				return true, nil, nil
+			}
+			client.PrependReactor("delete", "pods", lockStepDeleteReactor)
+
 			scheduler, err := NewScheduler(Configuration{
 				Namespace:     testNamespace,
 				SchedulerName: "test-ws-scheduler",
@@ -263,31 +270,44 @@ func TestSchedulePod(t *testing.T) {
 				q.Add(qp)
 			}
 
+			// actually run the test
 			for _, expectation := range test.Expectations {
-				cycleCtx, cancelCycleCtx := context.WithTimeout(ctx, 10*time.Second)
-				allGhostsGotDeleted, err := watchForGhostDeletions(cycleCtx, client, expectation)
+				cycleCtx, cancelCycleCtx := context.WithTimeout(ctx, 5*time.Second)
+				allGhostsGotDeleted, _, err := watchForGhostDeletions(cycleCtx, client, expectation)
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				// actually run the test
-				for _, exp := range expectation {
+				for i := 0; i < len(expectation); i++ {
 					pi, wasClosed := q.Pop()
 					if wasClosed {
 						t.Fatalf("queue was closed but still expected pods!")
 					}
+					exp, present := expectation[pi.Pod.Name]
+					if !present {
+						t.Fatalf("missing testdata: no expectation for pod '%s'!", pi.Pod.Name)
+					}
 
-					err = scheduler.schedulePod(cycleCtx, pi, bindPodToNode, createEvent)
-					if exp.Kind == resultNotEnoughResources {
-						if err == nil {
-							t.Fatalf("expected error for '%s' (kind: %s), got none!", pi.Pod.Name, exp.Kind)
-						}
-					} else {
-						if err != nil {
-							t.Fatal(err)
-						}
+					result, err := scheduler.schedulePod(cycleCtx, pi, bindPodToNode, createEvent)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if result != exp.Result {
+						t.Fatalf("expected result '%s', got '%s'!", exp.Result, result)
 					}
 				}
+
+				// perform all deletes and make sure they're done
+				lockDeletes = false
+				for _, podToDelete := range lockStepDeletes {
+					err = client.CoreV1().Pods(testNamespace).Delete(cycleCtx, podToDelete, metav1.DeleteOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				lockStepDeletes = []string{}
+				lockDeletes = true
+				<-allGhostsGotDeleted
 
 				// compare result
 				for podName, exp := range expectation {
@@ -296,11 +316,11 @@ func TestSchedulePod(t *testing.T) {
 						t.Fatalf("inconsistent test data: ")
 					}
 
-					if exp.Kind == resultBound {
+					if exp.Result == resultBound {
 						if qp.Spec.NodeName == "" {
 							t.Fatalf("expected pod '%s' to be bound but it wasn't!", qp.Name)
 						}
-					} else if exp.Kind == resultUnbound {
+					} else if exp.Result == resultWaitingForGhost {
 						if qp.Spec.NodeName != "" {
 							t.Fatalf("expected pod '%s' to be unbound but it was bound to '%s'!", qp.Name, qp.Spec.NodeName)
 						}
@@ -318,7 +338,6 @@ func TestSchedulePod(t *testing.T) {
 
 				// make sure this round is "done" and we get a defined state for the next cycle
 				q.MoveAllToActive("endCycle")
-				<-allGhostsGotDeleted
 				cancelCycleCtx()
 			}
 
@@ -329,11 +348,13 @@ func TestSchedulePod(t *testing.T) {
 	}
 }
 
-func watchForGhostDeletions(ctx context.Context, client *fakek8s.Clientset, expectation Expectation) (<-chan struct{}, error) {
+func watchForGhostDeletions(ctx context.Context, client *fakek8s.Clientset, expectation Expectation) (<-chan struct{}, int, error) {
 	toDelete := map[string]bool{}
+	nrOfExpectedDeletes := 0
 	for _, exp := range expectation {
 		if exp.DeletedGhost != "" {
 			toDelete[exp.DeletedGhost] = true
+			nrOfExpectedDeletes++
 		}
 	}
 
@@ -342,7 +363,7 @@ func watchForGhostDeletions(ctx context.Context, client *fakek8s.Clientset, expe
 		Watch:         true,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	allDeletedChan := make(chan struct{}, 1)
@@ -370,7 +391,7 @@ func watchForGhostDeletions(ctx context.Context, client *fakek8s.Clientset, expe
 		}
 	}()
 
-	return allDeletedChan, nil
+	return allDeletedChan, nrOfExpectedDeletes, nil
 }
 
 func findPod(name string, queued []*corev1.Pod) *corev1.Pod {
