@@ -1,9 +1,3 @@
-/**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
- * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
- */
-
 // package: contentservice
 // file: blobs.proto
 
@@ -18,6 +12,9 @@ export class UploadUrlRequest extends jspb.Message {
 
     getName(): string;
     setName(value: string): UploadUrlRequest;
+
+    getContentType(): string;
+    setContentType(value: string): UploadUrlRequest;
 
 
     serializeBinary(): Uint8Array;
@@ -34,6 +31,7 @@ export namespace UploadUrlRequest {
     export type AsObject = {
         ownerId: string,
         name: string,
+        contentType: string,
     }
 }
 
@@ -65,6 +63,9 @@ export class DownloadUrlRequest extends jspb.Message {
     getName(): string;
     setName(value: string): DownloadUrlRequest;
 
+    getContentType(): string;
+    setContentType(value: string): DownloadUrlRequest;
+
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): DownloadUrlRequest.AsObject;
@@ -80,6 +81,7 @@ export namespace DownloadUrlRequest {
     export type AsObject = {
         ownerId: string,
         name: string,
+        contentType: string,
     }
 }
 
